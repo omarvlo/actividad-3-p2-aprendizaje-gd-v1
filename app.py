@@ -7,14 +7,14 @@ from google.cloud import storage
 from river import linear_model, preprocessing, metrics
 
 # =========================================================
-# CONFIGURACIÓN DE LA APLICACIÓN
+# CONFIGURACIÓN
 # =========================================================
-st.set_page_config(page_title="Aprendizaje en línea con River", page_icon="🚕")
-st.title("Aprendizaje en línea con River (Corregido)")
+st.set_page_config(page_title="Aprendizaje en línea", page_icon="")
+st.title("Aprendizaje en línea con River (Step-by-step desde GCS)")
 
 st.markdown("""
-Este panel demuestra cómo un modelo de **aprendizaje incremental** puede entrenarse y actualizarse 
-a partir de un dataset grande alojado en **Google Cloud Storage (GCS)**.  
+Este panel replica **exactamente** la lógica original del código del estudiante,
+pero ahora permite procesar **un archivo por clic**, en lugar de procesar todo el bucket.
 """)
 
 # =========================================================
@@ -26,7 +26,7 @@ def save_model_to_gcs(model, bucket_name, destination_blob):
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(destination_blob)
         blob.upload_from_string(pickle.dumps(model))
-        st.success(f"Modelo guardado en GCS: `{destination_blob}`")
+        st.success(f"Modelo guardado en GCS: {destination_blob}")
     except Exception as e:
         st.warning(f"No se pudo guardar el modelo: {e}")
 
@@ -35,182 +35,180 @@ def load_model_from_gcs(bucket_name, source_blob):
         client = storage.Client()
         bucket = client.bucket(bucket_name)
         blob = bucket.blob(source_blob)
+
         if blob.exists():
             data = blob.download_as_bytes()
             st.info("Modelo cargado desde GCS.")
             return pickle.loads(data)
         return None
+
     except Exception as e:
-        st.warning(f"⚠️ No se pudo cargar el modelo previo: {e}")
+        st.warning(f"No se pudo cargar el modelo previo: {e}")
         return None
 
 # =========================================================
-# CONFIGURACIÓN DE PARÁMETROS
+# PARÁMETROS
 # =========================================================
-bucket_name = st.text_input("Nombre del bucket de GCS:", "bucket_131025")
-prefix = st.text_input("Carpeta/prefijo dentro del bucket:", "tlc_yellow_trips_2022/")
-limite = st.number_input("Número de registros por archivo a procesar:", value=5000, step=100)
-mostrar_grafico = st.checkbox("Mostrar gráfico de evolución del R²", value=True)
+bucket_name = st.text_input("Bucket de GCS:", "bucket_131025")
+prefix = st.text_input("Prefijo/carpeta:", "tlc_yellow_trips_2022/")
+limite = st.number_input("Filas a procesar por archivo:", value=1000, step=100)
 
-# Parámetro de estabilidad
-RESET_THRESHOLD = -5.0  # Si el R2 cae por debajo de esto, reiniciamos el modelo
-
-# =========================================================
-# INICIALIZACIÓN DEL MODELO
-# =========================================================
 MODEL_PATH = "models/model_incremental.pkl"
 
+# =========================================================
+# INICIALIZAR MODELO
+# =========================================================
 if "model" not in st.session_state:
-    loaded = load_model_from_gcs(bucket_name, MODEL_PATH)
-    if loaded:
-        st.session_state.model = loaded
-    else:
-        # Pipeline: Estandarización -> Regresión Lineal
-        st.session_state.model = preprocessing.StandardScaler() | linear_model.LinearRegression()
-    
+    model = load_model_from_gcs(bucket_name, MODEL_PATH)
+    if model is None:
+        model = preprocessing.StandardScaler() | linear_model.LinearRegression()
+
+    st.session_state.model = model
     st.session_state.metric = metrics.R2()
     st.session_state.history = []
 
+    # lista de archivos del bucket e índice actual
+    st.session_state.blobs = None
+    st.session_state.index = 0
+
 model = st.session_state.model
-r2 = st.session_state.metric
+metric = st.session_state.metric
 
 # =========================================================
-# EXTRACCIÓN DE CARACTERÍSTICAS (Simplificada y Robusta)
+# FEATURE ENGINEERING (idéntico al estudiante)
 # =========================================================
+def _parse_time_fields(row):
+    if "pickup_hour" in row and pd.notna(row["pickup_hour"]):
+        try:
+            hour = int(pd.to_numeric(row["pickup_hour"], errors="coerce"))
+            return None, max(0, min(hour, 23))
+        except:
+            pass
+
+    for c in ("tpep_pickup_datetime", "lpep_pickup_datetime", "pickup_datetime"):
+        if c in row and pd.notna(row[c]):
+            dt = pd.to_datetime(row[c], errors="coerce", utc=False)
+            if pd.notna(dt):
+                return dt, int(dt.hour)
+    return None, 0
+
 def _extract_x(row):
-    # Usamos características simples y seguras para evitar explosión de gradientes
+    dist = float(pd.to_numeric(row.get("trip_distance", 0), errors="coerce") or 0)
+    psg  = float(pd.to_numeric(row.get("passenger_count", 0), errors="coerce") or 0)
+
+    dt, hour = _parse_time_fields(row)
+    dow = int(dt.weekday()) if isinstance(dt, pd.Timestamp) else 0
+    weekend = 1.0 if dow >= 5 else 0.0
+
     return {
-        "dist": float(row["trip_distance"]),
-        "pass": float(row["passenger_count"]),
-        # Nota: He quitado las transformaciones complejas de tiempo para 
-        # garantizar que funcione igual que el segundo código.
+        "dist": dist,
+        "log_dist": float(np.log1p(max(dist, 0))),
+        "pass": psg,
+        "hour": float(hour),
+        "dow": float(dow),
+        "is_weekend": weekend,
     }
 
+def _valid_target(v):
+    y = pd.to_numeric(v, errors="coerce")
+    if pd.isna(y):
+        return None
+    return float(y)
+
 # =========================================================
-# FUNCIÓN DE STREAMING (CORREGIDA)
+# PROCESAR UN SOLO ARCHIVO (MISMA LÓGICA DEL ESTUDIANTE)
 # =========================================================
-def stream_from_bucket(bucket_name, prefix, limite=5000, chunksize=1000):
+def process_single_blob(bucket_name, blob_name, limite=1000, chunksize=500):
+
     client = storage.Client()
     bucket = client.bucket(bucket_name)
-    blobs = list(bucket.list_blobs(prefix=prefix))
+    blob = bucket.blob(blob_name)
 
-    st.info(f"Se encontraron {len(blobs)} archivos en `{prefix}`.")
+    try:
+        content = blob.download_as_bytes()
+        buffer = io.BytesIO(content)
+        count = 0
 
-    # Referenciamos el modelo y métrica globalmente para poder resetearlos
-    global model, r2 
+        for chunk in pd.read_csv(buffer, chunksize=chunksize, low_memory=False):
 
-    for idx, blob in enumerate(blobs, start=1):
-        st.write(f"📦 Procesando archivo {idx}/{len(blobs)}: `{blob.name.split('/')[-1]}`")
+            if not {"trip_distance","passenger_count","fare_amount"}.issubset(chunk.columns):
+                continue
 
-        try:
-            content = blob.download_as_bytes()
-            buffer = io.BytesIO(content)
+            for col in ["trip_distance","passenger_count","fare_amount"]:
+                chunk[col] = pd.to_numeric(chunk[col], errors="coerce")
 
-            count = 0
-            
-            # Leemos por chunks para eficiencia
-            for chunk in pd.read_csv(buffer, chunksize=chunksize, low_memory=False):
-                
-                # 1. Validación de columnas
-                cols_needed = ["trip_distance", "passenger_count", "fare_amount"]
-                if not set(cols_needed).issubset(chunk.columns):
-                    continue
+            chunk = chunk.replace([np.inf, -np.inf], np.nan).dropna()
+            chunk = chunk[
+                chunk["fare_amount"].between(2,200) &
+                chunk["trip_distance"].between(0.1,50) &
+                chunk["passenger_count"].between(1,6)
+            ]
 
-                # 2. Conversión numérica forzada
-                for col in cols_needed:
-                    chunk[col] = pd.to_numeric(chunk[col], errors="coerce")
-
-                # 3. FILTRO ESTRICTO (Clave para que no explote el R2)
-                # Copiado del código que funciona:
-                chunk = chunk.replace([np.inf, -np.inf], np.nan).dropna(subset=cols_needed)
-                chunk = chunk[
-                    (chunk["fare_amount"].between(2, 200)) & 
-                    (chunk["trip_distance"].between(0.1, 50)) & 
-                    (chunk["passenger_count"].between(1, 6))
-                ]
-
-                if chunk.empty:
-                    continue
-
-                # 4. Bucle de aprendizaje
-                for _, row in chunk.iterrows():
-                    if count >= limite:
-                        break
-
-                    # Extracción de X e Y
-                    x = _extract_x(row)
-                    y = float(row["fare_amount"])
-
-                    # Predicción y Aprendizaje
-                    y_pred = model.predict_one(x)
-                    model.learn_one(x, y)
-                    r2.update(y, y_pred)
-                    
-                    count += 1
-
-                    # 5. MONITORIZACIÓN Y RESET (Salvavidas)
-                    # Si el modelo diverge (R2 muy negativo), lo reiniciamos
-                    if count > 500 and r2.get() < RESET_THRESHOLD:
-                        st.warning(f"⚠️ Modelo inestable detectado (R²={r2.get():.2f}). Reiniciando pesos...")
-                        # Reiniciar modelo y métrica
-                        model = preprocessing.StandardScaler() | linear_model.LinearRegression()
-                        r2 = metrics.R2()
-                        st.session_state.model = model
-                        st.session_state.metric = r2
-                        break # Salimos del chunk actual para empezar limpios
-
+            for _, row in chunk.iterrows():
                 if count >= limite:
                     break
 
-        except Exception as e:
-            st.error(f"Error leyendo `{blob.name}`: {e}")
-            continue
+                y = _valid_target(row["fare_amount"])
+                if y is None:
+                    continue
 
-        # Devolvemos el nombre y el score actual
-        yield blob.name, r2.get()
+                x = _extract_x(row)
 
-# =========================================================
-# LÓGICA DE ACTUALIZACIÓN
-# =========================================================
-if st.button("Actualizar modelo con datos del bucket"):
-    st.info("Iniciando entrenamiento incremental...")
+                pred = model.predict_one(x)
+                model.learn_one(x, y)
+                metric.update(y, pred)
 
-    progreso = st.progress(0)
-    nombres, valores = [], []
+                count += 1
 
-    blobs_count = len(list(storage.Client().bucket(bucket_name).list_blobs(prefix=prefix)))
-    if blobs_count == 0: blobs_count = 1
+    except Exception as e:
+        st.warning(f"Error en {blob_name}: {e}")
+        return None
 
-    # Iteramos sobre el generador
-    for i, (fname, score) in enumerate(stream_from_bucket(bucket_name, prefix, limite)):
-        nombres.append(fname.split("/")[-1])
-        valores.append(score)
-        
-        # Actualizar historial en Session State
-        st.session_state.history.append(score)
-        
-        # Barra de progreso
-        progreso.progress(min((i + 1) / blobs_count, 1.0))
-        st.write(f"R² acumulado tras `{fname}`: **{score:.4f}**")
-
-    progreso.empty()
-    st.success("¡Entrenamiento completado!")
-
-    # Guardar modelo actualizado
-    save_model_to_gcs(model, bucket_name, MODEL_PATH)
-
-    # Gráfico
-    if mostrar_grafico and st.session_state.history:
-        st.subheader("Evolución del R²")
-        df_hist = pd.DataFrame(st.session_state.history, columns=["R2"])
-        st.line_chart(df_hist)
+    return metric.get()
 
 # =========================================================
-# ESTADO
+# BOTÓN: PROCESAR SIGUIENTE ARCHIVO
+# =========================================================
+if st.button("Procesar siguiente archivo"):
+
+    if st.session_state.blobs is None:
+        client = storage.Client()
+        bucket = client.bucket(bucket_name)
+        st.session_state.blobs = list(bucket.list_blobs(prefix=prefix))
+        st.session_state.index = 0
+        st.info(f"Se encontraron {len(st.session_state.blobs)} archivos.")
+
+    blobs = st.session_state.blobs
+    idx = st.session_state.index
+
+    if idx >= len(blobs):
+        st.success("Todos los archivos ya fueron procesados.")
+    else:
+        blob = blobs[idx]
+        short = blob.name.split("/")[-1]
+        st.write(f"Procesando {idx+1}/{len(blobs)}: `{short}`")
+
+        score = process_single_blob(bucket_name, blob.name, int(limite))
+
+        if score is not None:
+            st.session_state.history.append(score)
+            st.write(f"{blob.name} — R² acumulado: **{score:.3f}**")
+            save_model_to_gcs(model, bucket_name, MODEL_PATH)
+
+        st.session_state.index += 1
+
+# =========================================================
+# ESTADO FINAL
 # =========================================================
 st.markdown("---")
-st.write(f"**R² Actual del modelo en memoria:** {r2.get():.4f}")
+st.subheader("Estado actual del modelo")
+st.write(f"R² actual: **{metric.get():.3f}**")
 
+if st.session_state.history:
+    st.line_chart(st.session_state.history)
+
+
+st.caption("Cloud Run + River • Dataset público de taxis NYC (2022)_221125")
 
 
 
